@@ -1,0 +1,201 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include "HX711.h"
+
+// ---------- RFID ----------
+#define SS_PIN 10
+#define RST_PIN 9
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+// ---------- LCD ----------
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ---------- BUZZER ----------
+#define BUZZER_PIN 8
+
+// ---------- ULTRASONIC ----------
+#define TRIG_PIN 4
+#define ECHO_PIN 5
+
+// ---------- LOAD CELL ----------
+#define LOADCELL_DOUT_PIN 3
+#define LOADCELL_SCK_PIN 2
+HX711 scale;
+
+const float CALIBRATION_FACTOR = -35200.0 * 5.0;
+
+// ---------- ITEM DATA ----------
+float ITEM_WEIGHT = 0.50; 
+String currentItem = "None";
+bool itemLocked = false;
+
+// ---------- STOCK ----------
+int totalItems = 0;
+int previousItems = 0;
+int alertCode = 0; // 0 = OK, 1 = wrong RFID, 2 = low stock
+
+// ---------- LOW STOCK TIMER ----------
+unsigned long lastLowStockBeep = 0;
+const unsigned long lowStockInterval = 3000; 
+
+// ---------- CUSTOMER MESSAGE ----------
+bool welcomeShown = false;
+
+// ---------- UTILITY ----------
+void beepShort() { tone(BUZZER_PIN, 1200, 150); }
+void beepAlert() { tone(BUZZER_PIN, 1000, 400); }
+void beepLowStock() { tone(BUZZER_PIN, 700, 600); }
+void beepItemLocked() { tone(BUZZER_PIN, 1500, 250); }
+
+float readDistanceCM() {
+  digitalWrite(TRIG_PIN, LOW); delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  return duration * 0.0343 / 2;
+}
+
+// ---------- LCD HOME SCREEN ----------
+void showHome() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Rack 2: ");
+  lcd.print(currentItem);
+
+  lcd.setCursor(0, 1);
+  lcd.print("Total: ");
+  lcd.print(totalItems);
+}
+
+// ---------- SETUP ----------
+void setup() {
+  Serial.begin(9600);
+  SPI.begin();
+  rfid.PCD_Init();
+
+  lcd.init();
+  lcd.backlight();
+
+  showHome();
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  scale.set_scale(CALIBRATION_FACTOR);
+  scale.tare();
+}
+
+// ---------- LOOP ----------
+void loop() {
+
+  float weight = scale.get_units(5);
+  totalItems = round(weight / ITEM_WEIGHT);
+
+  // ---------- CUSTOMER INTERACTION ----------
+  float distance = readDistanceCM();
+  if (distance < 20 && !welcomeShown) {
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.print("WELCOME");
+    welcomeShown = true;
+    delay(3000);
+    showHome();
+  }
+  else if (distance >= 20) {
+    welcomeShown = false;
+  }
+
+  // ---------- DETECT STOCK DECREASE TO 1 ----------
+  if (totalItems == 1 && previousItems > totalItems) {
+    lastLowStockBeep = millis();
+    alertCode = 2;
+  }
+
+  // ---------- REPEAT LOW STOCK BEEP ----------
+  if (totalItems == 1 && millis() - lastLowStockBeep >= lowStockInterval) {
+    lcd.clear();
+    lcd.print("LOW STOCK!");
+    beepLowStock();
+    lastLowStockBeep = millis();
+    showHome();
+  }
+
+  previousItems = totalItems;
+
+  showHome();
+
+  // ---------- RFID READ ----------
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+
+    byte firstByte = rfid.uid.uidByte[0];
+
+    if (itemLocked) {
+      lcd.clear();
+      lcd.print("ITEM LOCKED!");
+      beepItemLocked();
+      alertCode = 0;
+      delay(1500);
+      showHome();
+      return;
+    }
+
+    if (firstByte == 0x23) {
+      currentItem = "Water";
+      ITEM_WEIGHT = 0.50;
+      itemLocked = true;
+      alertCode = 0;
+    }
+    else if (firstByte == 0x43) {
+      currentItem = "Soda";
+      ITEM_WEIGHT = 0.33;
+      itemLocked = true;
+      alertCode = 0;
+    }
+    else {
+      lcd.clear();
+      lcd.print("WRONG TAG!");
+      beepAlert();
+      alertCode = 1;
+      delay(1500);
+      showHome();
+      return;
+    }
+
+    beepShort();
+    lcd.clear();
+    lcd.print("Scanned: ");
+    lcd.print(currentItem);
+    delay(1200);
+
+    lcd.clear();
+    lcd.print("Place Item...");
+
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+
+    while (readDistanceCM() > 20) { delay(50); }
+
+    delay(800);
+    weight = scale.get_units(5);
+    totalItems = round(weight / ITEM_WEIGHT);
+    previousItems = totalItems;
+
+    lcd.clear();
+    lcd.print("Item Added!");
+    delay(1200);
+
+    showHome();
+  }
+
+  // ---------- SERIAL OUTPUT for ThinkSpeak ----------
+  Serial.print("2,");  
+  Serial.print(totalItems); Serial.print(",");
+  Serial.print(weight, 2); Serial.print(",");
+  Serial.println(alertCode);
+
+  delay(200);
+}
